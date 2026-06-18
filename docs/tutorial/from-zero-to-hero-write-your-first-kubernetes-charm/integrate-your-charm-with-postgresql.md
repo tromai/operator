@@ -240,11 +240,8 @@ def _replan_workload(self) -> None:
 
     try:
         version = fastapi_demo.get_version(config.server_port)
-    except (urllib.error.URLError, json.JSONDecodeError) as version_e:
-        logger.error(
-            "Failed to get version from the server: %s. Please double check your port config",
-            version_e,
-        )
+    except RuntimeError as version_e:
+        logger.error("Failed to get workload version: %s", version_e)
         return
 
     self.unit.set_workload_version(version)
@@ -344,7 +341,9 @@ self.unit.status = ops.BlockedStatus(str(e))
 ```
 
 ```python
-self.unit.status = ops.BlockedStatus(str(version_e))
+self.unit.status = ops.BlockedStatus(
+    "Failed to get version from server: check port config"
+)
 ```
 
 ## Validate your charm
@@ -542,9 +541,9 @@ def test_database_integration(charm: pathlib.Path, juju: jubilant.Juju):
     version = juju.status().apps["fastapi-demo"].version
     # Ideally, the test should get the version directly from the workload application
     # (for example, through an API call) and use that in this assertion.
-    # For simplicity, we hardcode the major version here to avoid updates
-    # if api_demo_server is updated with a minor or patch release.
-    assert version.startswith("1.")
+    # For simplicity, we hardcode the version here. We update the tutorial whenever we
+    # release a new version of api_demo_server.
+    assert version == "1.0.4"
 ```
 
 This test depends on the `charm` fixture so that the test fails immediately if a `.charm` file isn't available.
