@@ -43,6 +43,7 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
+        stages: [pre-push]
       - id: zizmor
         name: zizmor (uv)
         entry: uv run --group lint -- zizmor

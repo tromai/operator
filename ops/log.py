@@ -30,6 +30,12 @@ if typing.TYPE_CHECKING:
     from .model import _ModelBackend
 
 
+class A:
+    """..."""
+
+    pass
+
+
 class JujuLogHandler(logging.Handler):
     """A handler for sending logs and warnings to Juju via juju-log."""
 
