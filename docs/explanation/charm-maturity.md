@@ -63,7 +63,7 @@ See more: [Charmlibs documentation](https://canonical.com/juju/docs/charmlibs/)
 
 `juju-http-proxy`, `juju-https-proxy`, and `juju-no-proxy` should influence the charm's behavior when the charm or charm workload makes any HTTP request.
 
-For the corresponding environment variables that the charm should read, see {external+juju:ref}`Juju | List of model configuration keys <list-of-model-configuration-keys>`
+To read the settings in your charm, see {ref}`manage-proxy-settings`. For the corresponding model configuration keys, see {external+juju:ref}`Juju | List of model configuration keys <list-of-model-configuration-keys>`
 
 ### The charm upgrades the application safely
 
