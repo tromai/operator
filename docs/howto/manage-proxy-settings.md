@@ -1,15 +1,11 @@
-(manage-proxy-settings)=
-# How to manage proxy settings
+(manage-proxy-configs)=
+# How to manage proxy configs
 
-Juju users can set the `juju-http-proxy`, `juju-https-proxy`, and `juju-no-proxy` {external+juju:ref}`model configuration keys <list-of-model-configuration-keys>` to tell charms to send their HTTP traffic through a proxy. Juju doesn't apply these options to your workload.
+Juju users can set the `juju-http-proxy`, `juju-https-proxy`, and `juju-no-proxy` {external+juju:ref}`model configuration keys <list-of-model-configuration-keys>` to influence how charm or charm workload makes any HTTP request. A {ref}`mature charm <charm-maturity>` must respect these proxy configs.
 
-Your charm and its workload must respect these proxy configs. This is a criterion for a {ref}`mature charm <charm-maturity>`.
+## Read the `juju-*-proxy` model configs
 
-## Implement the feature
-
-### Get the proxy settings
-
-Use [](ops.Model.proxy_config) to get the model's proxy settings. This returns an [](ops.ProxyConfig) instance:
+Use [](ops.Model.proxy_config) to get the model's proxy configs. This returns an [](ops.ProxyConfig) instance:
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -25,50 +21,58 @@ class MyCharm(ops.CharmBase):
         ...
 ```
 
-Empty strings for `juju-http-proxy` and `juju-https-proxy` are stored as `None` in [](ops.ProxyConfig).
+[](ops.ProxyConfig) stores empty strings for `juju-http-proxy` and `juju-https-proxy` as `None`.
 
-[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy`. An empty string is read as an empty tuple.
+[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy`. An empty string is read as an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
 
-Setting a model config doesn't fire any event. Therefore the charm can only read the latest value the next time an event fire.
+Setting a model config from the Juju CLI doesn't fire any event. The charm can only read the latest value the next time an event fire. `ops` exposes those model configs as plain strings, and doesn't validate them.
 
-`ops` reads those model configs as plain strings, and doesn't validate them. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
+## Manage the proxy options
 
-### Pass the settings to the workload
+### Manage proxy configs for the charm
 
-Your charm needs to validate the proxy configs, and pass them to your workload, in the form that your workload expects.
+HTTP requests from the charm must respect the proxy configs. Set the configs depending on how the charm performs HTTP requests (for example, with `urllib` or `requests`).
 
-For a Kubernetes charm, a possible approach is to set environment variables in the Pebble layer. For example:
+{external+python:func}`urllib.request.urlopen` detects the proxy configs from `*_proxy` environmental variables. You can also configure it with a {external+python:class}`urllib.request.ProxyHandler` instance:
 
 ```python
-import urllib.parse
-
-import ops
-
-# The workload must always connect to these directly, in addition to the
-# entries in the model's juju-no-proxy setting.
-WORKLOAD_NO_PROXY = ('.svc', '.svc.cluster.local')
+import urllib.request
 
 
-def validate_proxy_url(name: str, url: str) -> None:
-    # Don't include the URL in the error. It might contain credentials.
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
-        raise ValueError(f'invalid {name}: expected an http:// or https:// URL')
+class MyCharm(ops.CharmBase):
 
+    def get_some_value_from_github_api(self):
+        url = 'https://api.github.com'
+        proxy_handler = urllib.request.ProxyHandler(
+            {
+                'http_proxy': self.model.proxy_config.http,
+                'https_proxy': self.model.proxy_config.https,
+                'no_poxy': list(self.model.proxy_config.no),
+            }
+        )
+        opener = urllib.request.build_opener(proxy_handler)
+        with opener.open(url) as response:
+            data = response.read().decode('utf-8')
+            return data
+```
 
+In `requests`, you can pass
+
+### Manage proxy configs for the workload
+
+For a Kubernetes charm, you can set environment variables in a Pebble layer. For example:
+
+```python
 def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
     """Return the environment variables for the workload service."""
     environment: dict[str, str] = {}
     for name, url in (('HTTP_PROXY', proxy.http), ('HTTPS_PROXY', proxy.https)):
         if not url:
             continue
-        validate_proxy_url(name, url)
-        # Tools disagree on the case of these variables, so set both.
+        # Set both lower and upper env variables, because tools might expects either.
         environment[name] = environment[name.lower()] = url
     if environment:
-        # dict.fromkeys removes duplicates and keeps the order stable. A stable value
-        # avoids needless workload restarts when the Pebble layer is replanned.
-        no_proxy = ','.join(dict.fromkeys((*proxy.no, *WORKLOAD_NO_PROXY)))
+        no_proxy = ','.join(proxy.no)
         environment['NO_PROXY'] = environment['no_proxy'] = no_proxy
     return environment
 
@@ -107,16 +111,17 @@ class MyCharm(ops.CharmBase):
         self.unit.status = ops.ActiveStatus()
 ```
 
-A machine charm can write the values where your workload reads them. For example, a systemd drop-in file with `Environment=` lines, or the workload's own configuration file.
+A machine charm can write the values where your workload reads them. For example, a systemd drop-in file with `Environment=` lines, or to environment variables like `HTTP_PROXY`.
 
 
 ```{admonition} Best practice
 :class: hint
 
 Don't include the proxy URL in log messages or in the status message, as it can contain credentials.
+Set both lowercase and uppercase proxy environment variables, as tools can depend on either of them.
 ```
 
-Examples: [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers) and [`mysql-operators`](https://github.com/canonical/mysql-operators) pass the settings to workloads through the Pebble layer. [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator) validates strictly and converts the values to JVM options.
+Examples: [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers) and [`mysql-operators`](https://github.com/canonical/mysql-operators) pass the configs to workloads through the Pebble layer. [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator) validates and converts the values to JVM options.
 
 ## Test the feature
 
