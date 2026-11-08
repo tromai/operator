@@ -127,7 +127,7 @@ Manage interfaces <manage-interfaces>
 Manage secrets <manage-secrets>
 Manage stored state <manage-stored-state>
 Manage opened ports <manage-opened-ports>
-Manage proxy settings <manage-proxy-settings>
+Manage proxy options <manage-proxy-configs>
 Manage the charm version <manage-the-charm-version>
 Manage the workload version <manage-the-workload-version>
 ```
