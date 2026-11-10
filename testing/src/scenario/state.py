@@ -299,10 +299,11 @@ class ProxyConfig:
     """
 
     def _to_ops(self) -> ProxyConfig_Ops:
+        sorted_no = sorted(entry.strip() for entry in self.no if entry.strip())
         return ProxyConfig_Ops(
             http=self.http or None,
             https=self.https or None,
-            no=tuple(entry.strip() for entry in self.no if entry.strip()),
+            no=tuple(sorted_no),
         )
 
 

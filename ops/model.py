@@ -382,7 +382,11 @@ class Application:
     """
 
     def __init__(
-        self, name: str, meta: _charm.CharmMeta, backend: _ModelBackend, cache: _ModelCache
+        self,
+        name: str,
+        meta: _charm.CharmMeta,
+        backend: _ModelBackend,
+        cache: _ModelCache,
     ):
         self.name = name
         self._backend = backend
@@ -1084,7 +1088,9 @@ class Binding:
         return self._network
 
 
-def _cast_network_address(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | str:
+def _cast_network_address(
+    raw: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | str:
     # fields marked as network addresses need not be IPs; they could be
     # hostnames that juju failed to resolve. In that case, we'll log a
     # debug message and leave it as-is.
@@ -1148,7 +1154,9 @@ class Network:
             self.egress_subnets.append(ipaddress.ip_network(subnet))
 
     @property
-    def bind_address(self) -> ipaddress.IPv4Address | ipaddress.IPv6Address | str | None:
+    def bind_address(
+        self,
+    ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | str | None:
         """A single address that the charm's application should bind() to.
 
         For the common case where there is a single answer. This represents a single
@@ -2290,7 +2298,9 @@ class StatusBase:
     def register(cls, child: type[StatusBase]):
         """.. deprecated:: 2.17.0 Deprecated - this was for internal use only."""
         warnings.warn(
-            'StatusBase.register is for internal use only', DeprecationWarning, stacklevel=2
+            'StatusBase.register is for internal use only',
+            DeprecationWarning,
+            stacklevel=2,
         )
         cls._register(child)
         return child
@@ -2611,7 +2621,10 @@ class Container:
     """The name of the container from ``metadata.yaml``, for example "postgres"."""
 
     def __init__(
-        self, name: str, backend: _ModelBackend, pebble_client: pebble.Client | None = None
+        self,
+        name: str,
+        backend: _ModelBackend,
+        pebble_client: pebble.Client | None = None,
     ):
         self.name = name
 
@@ -3146,7 +3159,8 @@ class Container:
                 yield info
             else:
                 logger.debug(
-                    'skipped unsupported file in Container.[push/pull]_path: %s', info.path
+                    'skipped unsupported file in Container.[push/pull]_path: %s',
+                    info.path,
                 )
 
     @staticmethod
@@ -3165,7 +3179,11 @@ class Container:
         # select between the two following src+dst combos via trailing '/*'
         # /src/* --> /dst/*
         # /src --> /dst/src
-        file_path, source_path, dest_dir = Path(file_path), Path(source_path), Path(dest_dir)
+        file_path, source_path, dest_dir = (
+            Path(file_path),
+            Path(source_path),
+            Path(dest_dir),
+        )
         prefix = str(source_path.parent)
         if prefix != '.' and os.path.commonpath([prefix, str(file_path)]) != prefix:
             raise RuntimeError(f'file "{file_path}" does not have specified prefix "{prefix}"')
@@ -3826,7 +3844,10 @@ class _ModelBackend:
         # "relation-list --app" to get it.
         try:
             with self._wrap_hookcmd(
-                'relation-list', relation_id=relation_id, endpoint=relation_name, app=True
+                'relation-list',
+                relation_id=relation_id,
+                endpoint=relation_name,
+                app=True,
             ):
                 return hookcmds.relation_list(relation_id, endpoint=relation_name, app=True)
         except RelationNotFoundError:
@@ -3943,7 +3964,9 @@ class _ModelBackend:
                 args.extend(['--k8s-resources', str(k8s_res_path)])
             with self._wrap_hookcmd('pod-spec-set'):
                 hookcmds._utils.run(
-                    'pod-spec-set', *args, redacted_cmd=['pod-spec-set', '--', '<redacted>']
+                    'pod-spec-set',
+                    *args,
+                    redacted_cmd=['pod-spec-set', '--', '<redacted>'],
                 )
         finally:
             shutil.rmtree(str(tmpdir))
@@ -4087,7 +4110,11 @@ class _ModelBackend:
                     'mac-address': b_addr.mac_address,
                     'interface-name': b_addr.interface_name,
                     'addresses': [
-                        {'value': addr.value, 'cidr': addr.cidr, 'hostname': addr.hostname}
+                        {
+                            'value': addr.value,
+                            'cidr': addr.cidr,
+                            'hostname': addr.hostname,
+                        }
                         for addr in b_addr.addresses
                     ],
                 }
@@ -4098,7 +4125,9 @@ class _ModelBackend:
         }
 
     def add_metrics(
-        self, metrics: Mapping[str, int | float], labels: Mapping[str, str] | None = None
+        self,
+        metrics: Mapping[str, int | float],
+        labels: Mapping[str, str] | None = None,
     ) -> None:
         args: list[str] = []
         if labels:
@@ -4567,6 +4596,8 @@ class ProxyConfig:
     The ``http`` and ``https`` attributes are ``None`` if the corresponding model config
     is not available (either its env var is unset, or its value is empty). ``no`` is
     an empty tuple in that case.
+
+    `no` is the sorted tuple of entries from ``juju-no-proxy``.
     """
 
     def __init__(
@@ -4578,7 +4609,7 @@ class ProxyConfig:
     ):
         self._http = http
         self._https = https
-        self._no = no
+        self._no = tuple(sorted(no))
 
     @property
     def http(self) -> str | None:
@@ -4596,14 +4627,38 @@ class ProxyConfig:
 
         This is the comma-separated model config split into its entries, and is an
         empty tuple if the model config is not available. Entries can contain '*',
-        and a '*' entry excludes all destinations.
+        and a '*' entry excludes all destinations. Entries are sorted.
         """
         return self._no
 
+    def to_env(self) -> dict[str, str]:
+        """Build the simulated environment the operator framework expects.
+
+        None values become empty strings for all env variables. The env vars include
+        both lower and upper cases variants.
+        """
+        environment: dict[str, str] = {}
+        for name, url in (
+            ('HTTP_PROXY', self.http),
+            ('HTTPS_PROXY', self.https),
+        ):
+            environment[name] = environment[name.lower()] = url or ''
+
+        no_proxy = None
+        if self.no:
+            no_proxy = ','.join(self.no)
+
+        environment['NO_PROXY'] = environment['no_proxy'] = no_proxy or ''
+        return environment
+
     def __repr__(self) -> str:
-        return f'ProxyConfig(http={self._http!r}, https={self._https!r}, no={self._no!r})'
+        return f'ProxyConfig(http={self.http!r}, https={self.https!r}, no={self.no!r})'
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ProxyConfig):
             return False
-        return (self._http, self._https, self._no) == (other._http, other._https, other._no)
+        return (self.http, self.https, self.no) == (
+            other.http,
+            other.https,
+            other.no,
+        )

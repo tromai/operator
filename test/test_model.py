@@ -1418,6 +1418,46 @@ class TestModel:
         model = ops.Model(ops.CharmMeta(), backend)
         assert model.proxy_config.http == 'context-http-proxy-url'
 
+    def test_proxy_config_to_env(self, monkeypatch: pytest.MonkeyPatch):
+        context = JujuContext._from_dict({
+            'JUJU_VERSION': '3.6.2',
+            'JUJU_CHARM_HTTP_PROXY': 'context-http-proxy-url',
+            'JUJU_CHARM_HTTPS_PROXY': 'context-https-proxy-url',
+            'JUJU_CHARM_NO_PROXY': 'a,b,*.c,10.0.0.0/8',
+        })
+        backend = _ModelBackend('myapp/0', juju_context=context)
+        model = ops.Model(ops.CharmMeta(), backend)
+
+        expected_proxy_env = {
+            'HTTP_PROXY': 'context-http-proxy-url',
+            'HTTPS_PROXY': 'context-https-proxy-url',
+            'NO_PROXY': '*.c,10.0.0.0/8,a,b',
+            'http_proxy': 'context-http-proxy-url',
+            'https_proxy': 'context-https-proxy-url',
+            'no_proxy': '*.c,10.0.0.0/8,a,b',
+        }
+        assert model.proxy_config.to_env() == expected_proxy_env
+
+    def test_proxy_config_to_env_empty_no(self, monkeypatch: pytest.MonkeyPatch):
+        context = JujuContext._from_dict({
+            'JUJU_VERSION': '3.6.2',
+            'JUJU_CHARM_HTTP_PROXY': 'context-http-proxy-url',
+            'JUJU_CHARM_HTTPS_PROXY': 'context-https-proxy-url',
+            'JUJU_CHARM_NO_PROXY': '',
+        })
+        backend = _ModelBackend('myapp/0', juju_context=context)
+        model = ops.Model(ops.CharmMeta(), backend)
+
+        expected_proxy_env = {
+            'HTTP_PROXY': 'context-http-proxy-url',
+            'HTTPS_PROXY': 'context-https-proxy-url',
+            'NO_PROXY': '',
+            'http_proxy': 'context-http-proxy-url',
+            'https_proxy': 'context-https-proxy-url',
+            'no_proxy': '',
+        }
+        assert model.proxy_config.to_env() == expected_proxy_env
+
     def test_relation_remote_model(self, fake_script: FakeScript, fake_juju_version: None):
         fake_script.write('relation-list', """echo '["remoteapp1/0"]'""")
         fake_script.write('relation-ids', """echo '["db0:1"]'""")
