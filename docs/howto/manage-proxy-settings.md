@@ -3,7 +3,7 @@
 
 Juju users can set the `juju-http-proxy`, `juju-https-proxy`, and `juju-no-proxy` {external+juju:ref}`model configuration keys <list-of-model-configuration-keys>` to influence how charm or charm workload makes any HTTP request. A {ref}`mature charm <charm-maturity>` must respect these proxy configs.
 
-## Read the `juju-*-proxy` model configs
+## Access the `juju-*-proxy` model configs
 
 Use [](ops.Model.proxy_config) to get the model's proxy configs. This returns an [](ops.ProxyConfig) instance:
 
@@ -23,48 +23,24 @@ class MyCharm(ops.CharmBase):
 
 [](ops.ProxyConfig) stores empty strings for `juju-http-proxy` and `juju-https-proxy` as `None`.
 
-[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy`. An empty string is read as an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
+[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy`. An empty `juju-no-proxy` is read as an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
 
 Setting a model config from the Juju CLI doesn't fire any event. The charm can only read the latest value the next time an event fire. `ops` exposes those model configs as plain strings, and doesn't validate them.
 
-## Manage the proxy options
+## Manage proxy options
 
-### Manage proxy configs for the charm
+The charm and its workload are separate processes, and each one must respect the proxy configs. Both read the values from [](ops.Model.proxy_config), but they receive them in different ways:
 
-HTTP requests from the charm must respect the proxy configs. Set the configs depending on how the charm performs HTTP requests (for example, with `urllib` or `requests`).
+- The charm makes its own HTTP requests, for example to download a file.
+- The workload makes its own HTTP requests. How it reads proxy configs depends on the workload. Most workloads read the `*_proxy` or `*_PROXY` environment variables. Some read a configuration file or start-up flags (for example, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator) uses JVM flags).
 
-{external+python:func}`urllib.request.urlopen` detects the proxy configs from `*_proxy` environmental variables. You can also configure it with a {external+python:class}`urllib.request.ProxyHandler` instance:
+Because Juju doesn't fire an event when the proxy configs change, apply them in a handler that runs on every event, not only at install time or when the workload is first started. Compare the new value with what the workload already uses, and restart the workload only when the value changed. This is the approach that [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers) uses: it rebuilds the Pebble layer on every event and restarts the services if the layer differs from the current plan.
 
-```python
-import urllib.request
-
-
-class MyCharm(ops.CharmBase):
-
-    def get_some_value_from_github_api(self):
-        url = 'https://api.github.com'
-        proxy_handler = urllib.request.ProxyHandler(
-            {
-                'http_proxy': self.model.proxy_config.http,
-                'https_proxy': self.model.proxy_config.https,
-                'no_poxy': list(self.model.proxy_config.no),
-            }
-        )
-        opener = urllib.request.build_opener(proxy_handler)
-        with opener.open(url) as response:
-            data = response.read().decode('utf-8')
-            return data
-```
-
-In `requests`, you can pass
-
-### Manage proxy configs for the workload
-
-For a Kubernetes charm, you can set environment variables in a Pebble layer. For example:
+Both the charm and the workload can use this helper to turn [](ops.ProxyConfig) into environment variables:
 
 ```python
 def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
-    """Return the environment variables for the workload service."""
+    """Return the proxy environment variables for the charm or the workload."""
     environment: dict[str, str] = {}
     for name, url in (('HTTP_PROXY', proxy.http), ('HTTPS_PROXY', proxy.https)):
         if not url:
@@ -75,12 +51,38 @@ def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
         no_proxy = ','.join(proxy.no)
         environment['NO_PROXY'] = environment['no_proxy'] = no_proxy
     return environment
+```
+
+Keep the output of the helper stable. The same input must always give the same dictionary, in the same order. Otherwise, the charm sees a change on every event and restarts the workload each time.
+
+### Manage proxy options for the charm
+
+The charm process is short-lived: Juju starts a new one for every event. Set the environment variables at the start of the handler, before the charm makes a request. Libraries such as {external+python:func}`urllib.request.urlopen` and `requests` detect the proxy configs from these variables:
+
+```python
+import os
+import urllib.request
 
 
+class MyCharm(ops.CharmBase):
+    def get_some_value_from_github_api(self):
+        os.environ.update(proxy_environment(self.model.proxy_config))
+        with urllib.request.urlopen('https://api.github.com') as response:
+            return response.read().decode('utf-8')
+```
+
+To avoid changing the environment, pass the values to the library instead. For example, pass a {external+python:class}`urllib.request.ProxyHandler` to {external+python:func}`urllib.request.build_opener`. `urllib` only reads `no_proxy` from the environment. For `requests`, see [Advanced usage | Proxies](https://requests.readthedocs.io/en/latest/user/advanced/#proxies).
+
+### Manage proxy options for the workload on Kubernetes
+
+Pebble services don't inherit the charm's environment. Pass the proxy configs in the `environment` of each service in the Pebble layer. When the layer changes, `Container.replan()` restarts only the services whose configuration changed. If the layer is the same, `replan()` leaves the running services alone, so it's safe to call on every event.
+
+```python
 class MyCharm(ops.CharmBase):
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
         framework.observe(self.on['workload'].pebble_ready, self._update_workload)
+        framework.observe(self.on.config_changed, self._update_workload)
         framework.observe(self.on.update_status, self._update_workload)
 
     def _update_workload(self, event: ops.EventBase) -> None:
@@ -111,14 +113,63 @@ class MyCharm(ops.CharmBase):
         self.unit.status = ops.ActiveStatus()
 ```
 
-A machine charm can write the values where your workload reads them. For example, a systemd drop-in file with `Environment=` lines, or to environment variables like `HTTP_PROXY`.
+Observing `update-status` makes the charm pick up a change within the update-status interval (five minutes by default). Observe any other event that your charm handles, to pick up the change sooner.
 
+If the workload reads the proxy configs from a file or from start-up flags, build the file content or the `command` from the same values. Put them in the layer, or push the file with `Container.push()` and restart the service when the content changed.
+
+### Manage proxy options for the workload on a machine
+
+A machine charm must write the values to the place where the workload reads them, and restart or reload the workload when they change. For a workload that runs as a systemd service, a drop-in file with `Environment=` lines is a common choice. Only write the file and restart the service when the content has changed:
+
+```python
+import pathlib
+import subprocess
+
+DROP_IN = pathlib.Path('/etc/systemd/system/my-service.service.d/proxy.conf')
+
+
+def write_proxy_drop_in(environment: dict[str, str]) -> bool:
+    """Write the systemd drop-in file for the service, and return whether it changed."""
+    content = None
+    if environment:
+        # systemd expands % specifiers in values, so escape them.
+        lines = [f'Environment="{k}={v.replace("%", "%%")}"' for k, v in sorted(environment.items())]
+        content = '[Service]\n' + '\n'.join(lines) + '\n'
+    current = DROP_IN.read_text() if DROP_IN.exists() else None
+    if content == current:
+        return False
+    if content is None:
+        DROP_IN.unlink()
+    else:
+        DROP_IN.parent.mkdir(parents=True, exist_ok=True)
+        # The URL can contain credentials, so restrict who can read the file.
+        DROP_IN.touch(mode=0o600)
+        DROP_IN.write_text(content)
+    return True
+
+
+class MyCharm(ops.CharmBase):
+    def __init__(self, framework: ops.Framework):
+        super().__init__(framework)
+        framework.observe(self.on.config_changed, self._update_workload)
+        framework.observe(self.on.update_status, self._update_workload)
+
+    def _update_workload(self, event: ops.EventBase) -> None:
+        if write_proxy_drop_in(proxy_environment(self.model.proxy_config)):
+            subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True, capture_output=True)
+            subprocess.run(
+                ['/usr/bin/systemctl', 'restart', 'my-service'], check=True, capture_output=True
+            )
+```
+
+Keep the systemd calls in your workload module, as described in {ref}`run-workloads-with-a-charm-machines`. If the workload reads a configuration file, render the proxy settings into that file in the same way, and reload the workload when the content changed. For a snap, use `snap set` or the snap's own configuration instead of a drop-in file.
 
 ```{admonition} Best practice
 :class: hint
 
 Don't include the proxy URL in log messages or in the status message, as it can contain credentials.
 Set both lowercase and uppercase proxy environment variables, as tools can depend on either of them.
+Each tool receives proxy config differently, so check how your workload reads them.
 ```
 
 Examples: [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers) and [`mysql-operators`](https://github.com/canonical/mysql-operators) pass the configs to workloads through the Pebble layer. [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator) validates and converts the values to JVM options.
