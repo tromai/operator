@@ -7,7 +7,7 @@ breakpoint
 callables
 Canonical's
 Charmlibs
-CIDR
+CIDRs
 configurator
 cooldown
 cosl
