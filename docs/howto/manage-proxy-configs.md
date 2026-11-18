@@ -23,16 +23,89 @@ class MyCharm(ops.CharmBase):
 
 [](ops.ProxyConfig) stores empty strings for `juju-http-proxy` and `juju-https-proxy` as `None`.
 
-[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy`. An empty `juju-no-proxy` is read as an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
+[](ops.ProxyConfig)'s `no` attribute contains the comma-separated entries of `juju-no-proxy` as a string tuple. An empty `juju-no-proxy` is read as an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
 
-Setting a model config from the Juju CLI doesn't fire any event. The charm can only read the latest value the next time an event fire. `ops` exposes those model configs as plain strings, and doesn't validate them.
+`ops` exposes those model configs as plain strings, and doesn't validate them.
+
+<!-- Should I link to the explanation page holistic vs delta charm ? -->
+Juju doesn't fire an event when the proxy configs change. To capture it, the charm must read the proxy configs in every event that it is interested in, following the :ref:`reconciler pattern <handling-events-holistically>`. The charm should only update its workload when the proxy configs change.
+
+```python
+class MyCharm(ops.CharmBase):
+    def __init__(self, framework: ops.Framework) -> None:
+        super().__init__(framework)
+        framework.observe(self.on.proxy_app.pebble_ready, self._reconciler)
+        framework.observe(self.on.config_changed, self._reconciler)
+        framework.observe(self.on.update_status, self._reconciler)
+        self.container = self.unit.get_container('proxy-app')
+
+    # This can be provided by ops too.
+    def _proxy_env(self) -> dict[str, str]:
+        proxy = self.model.proxy_config
+        return {
+            # Empty string to disable any existing proxy config in the container.
+            "HTTP_PROXY": proxy.http or '',
+            "HTTPS_PROXY": proxy.https or '',
+            "http_proxy": proxy.http or '',
+            "https_proxy": proxy.https or '',
+            # Keep it sorted so that the
+            # same NO_PROXY won't trigger a service restart.
+            "NO_PROXY": ",".join(sorted(proxy.no)),
+            "no_proxy": ",".join(sorted(proxy.no)),
+        }
+
+    def _proxy_config_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
+        return ops.pebble.Layer(
+            {
+                "services": {
+                    "proxy-app": {
+                        "override": "merge",
+                        "environment": proxy_env,
+                    }
+                },
+            }
+        )
+
+    def _reconciler(self, _: ops.EventBase) -> None:
+        # Early checks
+        workload_ready = self.workload.is_ready
+
+        if not workload_ready:
+            return
+
+        proxy_env = self._proxy_env()
+        container_env = self.container.get_plan().services["proxy-app"].environment
+
+        # This can be a helper function provided by ops.
+        changed = False
+        for proxy_name, proxy_val in proxy_env:
+            if env := container.get(proxy_name):
+                changed = env == proxy_val
+            else:
+                changed = True
+                break
+
+        if changed:
+            self.container.add_layer(
+                "proxy-workload",
+                self._proxy_config_layer(proxy_env),
+                combine=True,
+            )
+            self.container.replan()
+```
+
+[`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers/blob/main/src/coordinated_workers/worker.py) uses a similar approach: it rebuilds the Pebble layer on every reconcilable event and restarts the services if the layer differs from the current plan.
+
+
 
 ## Manage proxy options
 
 Any HTTP request from the charm and its workload (if available) must respect the proxy configs. The charm code should read the values from [](ops.Model.proxy_config)
 and decide what to do with it.
 
-Because Juju doesn't fire an event when the proxy configs change, read them in a handler that runs on every event. The charm should compare the new value with what the workload already uses, and restart the workload if the value changed. This is the approach that [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers) uses: it rebuilds the Pebble layer on every event and restarts the services if the layer differs from the current plan.
+Because Juju doesn't fire an event when the proxy configs change, read them in a handler that runs on every event. This follows the reconciler pattern.
+
+
 
 <!--Both the charm and the workload can use this helper to turn [](ops.ProxyConfig) into environment variables:
 
