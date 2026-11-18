@@ -189,26 +189,172 @@ For `requests`, see [requests | Advanced usage | Proxies](https://requests.readt
 
 See first: {ref}`write-unit-tests-for-a-charm`
 
-Needs to tailor to previous examples:
+To set the proxy configs in a unit test, pass a [](ops.testing.ProxyConfig) to [](ops.testing.Model). The charm reads the values with [](ops.Model.proxy_config), as it would in a real Juju model. A default `ProxyConfig()` matches a model that has no proxy configs.
 
-An example for k8s charm:
+Test that the proxy configs reach the workload, and that the charm clears them when the proxy configs are removed.
+
+#### Test a Kubernetes charm
+
+For a Kubernetes charm, check the environment of the workload service in the Pebble plan:
 
 ```python
-# Set proxy configs
-# Initialize the charm with a layer
-# Assert that the layer contains the proxy configs
-# Remove proxy configs
-# Assert that proxy configs are removed from the layer
+import ops
+from ops import testing
+
+from charm import MyCharm
+
+PROXY_URL = 'http://proxy.example.com:3128'
+
+
+def workload_layer() -> ops.pebble.Layer:
+    """The layer that defines the workload service, before any proxy configs."""
+    return ops.pebble.Layer({
+        'services': {
+            'proxy-app': {
+                'override': 'replace',
+                'command': 'my-workload',
+                'startup': 'enabled',
+            }
+        }
+    })
+
+
+def test_proxy_configs_reach_the_workload():
+    ctx = testing.Context(MyCharm)
+    container = testing.Container(
+        'proxy-app',
+        can_connect=True,
+        layers={'base': workload_layer()},
+    )
+    proxy_config = testing.ProxyConfig(
+        https=PROXY_URL,
+        no=('localhost', '10.0.0.0/8'),
+    )
+    state_in = testing.State(
+        containers={container},
+        model=testing.Model(proxy_config=proxy_config),
+    )
+
+    state_out = ctx.run(ctx.on.pebble_ready(container), state_in)
+
+    plan = state_out.get_container('proxy-app').plan
+    environment = plan.services['proxy-app'].environment
+    assert environment['HTTPS_PROXY'] == PROXY_URL
+    assert environment['https_proxy'] == PROXY_URL
+    assert environment['HTTP_PROXY'] == ''
+    assert environment['NO_PROXY'] == '10.0.0.0/8,localhost'
+
+
+def test_removed_proxy_configs_are_cleared():
+    ctx = testing.Context(MyCharm)
+    # The workload has proxy configs from an earlier event.
+    proxy_layer = ops.pebble.Layer({
+        'services': {
+            'proxy-app': {
+                'override': 'merge',
+                'environment': {'HTTPS_PROXY': PROXY_URL, 'https_proxy': PROXY_URL},
+            }
+        }
+    })
+    container = testing.Container(
+        'proxy-app',
+        can_connect=True,
+        layers={'base': workload_layer(), 'proxy-workload': proxy_layer},
+    )
+    state_in = testing.State(
+        containers={container},
+        model=testing.Model(proxy_config=testing.ProxyConfig()),
+    )
+
+    state_out = ctx.run(ctx.on.update_status(), state_in)
+
+    plan = state_out.get_container('proxy-app').plan
+    environment = plan.services['proxy-app'].environment
+    assert environment['HTTPS_PROXY'] == ''
+    assert environment['https_proxy'] == ''
 ```
 
-An example for machine charm:
+#### Test a machine charm
+
+For a machine charm, check the file or API that the charm writes the proxy configs to. Replace the parts of the test that change the machine, so that the test doesn't need root access or a real service.
+
+The following tests are for a charm that:
+
+- Writes the proxy environment variables to a systemd drop-in file at `PROXY_DROP_IN`, with {external+charmlibs:func}`pathops.ensure_contents`.
+- Restarts the `SERVICE` service with {external+charmlibs:ref}`charmlibs-systemd <charmlibs-systemd>` only when the drop-in file changes.
 
 ```python
-# Set proxy configs
-# Initialize the charm
-# Assert that a systemd config file is created with the proxy config
-# Remove proxy configs
-# Assert that proxy configs are removed from the systemd config file.
+import pathlib
+
+import pytest
+from charmlibs import pathops
+from ops import testing
+
+import charm
+
+PROXY_URL = 'http://proxy.example.com:3128'
+
+
+@pytest.fixture
+def drop_in(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> pathops.LocalPath:
+    """Write the drop-in file to a temporary directory instead of /etc/systemd."""
+    path = pathops.LocalPath(tmp_path / 'proxy.conf')
+    monkeypatch.setattr(charm, 'PROXY_DROP_IN', path)
+    return path
+
+
+@pytest.fixture
+def restarted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the services that the charm restarts, instead of calling systemctl."""
+    services: list[str] = []
+    monkeypatch.setattr(charm.systemd, 'daemon_reload', lambda: True)
+    monkeypatch.setattr(
+        charm.systemd, 'service_restart', lambda *args: services.extend(args) or True
+    )
+    return services
+
+
+def test_proxy_configs_reach_the_workload(drop_in: pathops.LocalPath, restarted: list[str]):
+    ctx = testing.Context(charm.MyCharm)
+    proxy_config = testing.ProxyConfig(https=PROXY_URL, no=('localhost', '10.0.0.0/8'))
+    state_in = testing.State(model=testing.Model(proxy_config=proxy_config))
+
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    content = drop_in.read_text()
+    assert f'Environment="HTTPS_PROXY={PROXY_URL}"' in content
+    assert f'Environment="https_proxy={PROXY_URL}"' in content
+    assert 'Environment="NO_PROXY=10.0.0.0/8,localhost"' in content
+    assert restarted == [charm.SERVICE]
+
+
+def test_removed_proxy_configs_are_cleared(drop_in: pathops.LocalPath, restarted: list[str]):
+    # The drop-in file has proxy configs from an earlier event.
+    drop_in.write_text(f'[Service]\nEnvironment="HTTPS_PROXY={PROXY_URL}"\n')
+    ctx = testing.Context(charm.MyCharm)
+    state_in = testing.State(model=testing.Model(proxy_config=testing.ProxyConfig()))
+
+    ctx.run(ctx.on.update_status(), state_in)
+
+    content = drop_in.read_text()
+    assert PROXY_URL not in content
+    assert 'Environment="HTTPS_PROXY="' in content
+    assert restarted == [charm.SERVICE]
+
+
+def test_unchanged_proxy_configs_dont_restart_the_workload(
+    drop_in: pathops.LocalPath, restarted: list[str]
+):
+    ctx = testing.Context(charm.MyCharm)
+    state_in = testing.State(
+        model=testing.Model(proxy_config=testing.ProxyConfig(https=PROXY_URL)),
+    )
+    ctx.run(ctx.on.config_changed(), state_in)
+    restarted.clear()
+
+    ctx.run(ctx.on.update_status(), state_in)
+
+    assert restarted == []
 ```
 
 (manage-proxy-settings-integration-tests)=
@@ -216,72 +362,117 @@ An example for machine charm:
 
 See first: {ref}`write-integration-tests-for-a-charm`
 
-In an integration test, change the proxy settings with [`juju.model_config`](jubilant.Juju.model_config), and check that the workload has picked up the values.
+In an integration test, change the proxy configs with [](jubilant.Juju.model_config), then check that the workload has the new values.
 
-Because Juju doesn't emit an event when the model configuration changes, the charm only notices the change when the next event runs.
+Juju doesn't fire an event when the proxy configs change, so the charm only reads the new values in its next event. To make the next event come sooner, set the `update-status-hook-interval` model config to a short interval for the test module. Then wait for the workload to have the new values, instead of waiting for a unit status, because the unit status doesn't change when the proxy configs change.
 
-To test if the workload receives the latest proxy configs. Some ideas:
-- K8s: Come up with a minimal API server that serves the proxy config options (one liner?). In the integration tests -> run the workload and then use an action to get the proxy configs for assertion.
-- Machine: Can use `juju.ssh(unit, 'systemctl', 'show', 'my-service', '--property=Environment')` ?
+#### Test a Kubernetes charm
 
-<!--This test is for a Kubernetes charm, and reads the Pebble plan. For a machine charm, replace `workload_plan` with a command that shows the environment of your service, such as `juju.ssh(unit, 'systemctl', 'show', 'my-service', '--property=Environment')`.-->
+For a Kubernetes charm, read the Pebble plan in the workload container:
 
-<!--```python
+```python
 import pathlib
 
 import jubilant
 import pytest
+import yaml
 
+APP = 'proxy-app'
+UNIT = f'{APP}/0'
 PROXY_URL = 'http://proxy.example.com:3128'
-UNIT = 'your-app/0'
 
 
-@pytest.fixture
-def fast_update_status(juju: jubilant.Juju):
-    """Make Juju run update-status every 10 seconds, so the charm notices model config changes."""
+@pytest.fixture(scope='module', autouse=True)
+def frequent_update_status(juju: jubilant.Juju):
+    """Run update-status every 10 seconds, so the charm reads the new proxy configs sooner."""
     juju.model_config({'update-status-hook-interval': '10s'})
     yield
     juju.model_config(reset='update-status-hook-interval')
 
 
-def workload_plan(juju: jubilant.Juju) -> str:
-    return juju.ssh(UNIT, '/charm/bin/pebble', 'plan', container='workload')
+def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
+    """Return the environment of the workload service in the Pebble plan."""
+    plan = juju.ssh(UNIT, '/charm/bin/pebble', 'plan', container='proxy-app')
+    return yaml.safe_load(plan)['services']['proxy-app'].get('environment', {})
 
 
-def test_proxy_settings_reach_the_workload(
-    charm: pathlib.Path, juju: jubilant.Juju, fast_update_status: None
-):
-    try:
-        juju.model_config({
-            'juju-https-proxy': PROXY_URL,
-            'juju-no-proxy': '127.0.0.1,localhost,::1,10.0.0.0/8',
-        })
-        juju.wait(
-            lambda status: (
-                jubilant.all_active(status) and f'HTTPS_PROXY: {PROXY_URL}' in workload_plan(juju)
-            ),
-            timeout=120,
-        )
-    finally:
-        juju.model_config(reset=['juju-https-proxy', 'juju-no-proxy'])
-    # Removing the proxy settings removes the variables.
+@pytest.mark.juju_setup
+def test_deploy(charm: pathlib.Path, juju: jubilant.Juju):
+    juju.deploy(charm, app=APP, resources={'proxy-app-image': 'ubuntu/nginx:latest'})
+    juju.wait(jubilant.all_active, timeout=600)
+
+
+def test_proxy_configs_reach_the_workload(juju: jubilant.Juju):
+    juju.model_config({'juju-https-proxy': PROXY_URL})
     juju.wait(
-        lambda status: jubilant.all_active(status) and 'HTTPS_PROXY' not in workload_plan(juju),
+        lambda _: workload_environment(juju).get('HTTPS_PROXY') == PROXY_URL,
+        delay=5,
         timeout=120,
     )
 
 
-def test_invalid_proxy_blocks_the_unit(
-    charm: pathlib.Path, juju: jubilant.Juju, fast_update_status: None
-):
-    try:
-        juju.model_config({'juju-https-proxy': 'not-a-url'})
-        juju.wait(jubilant.all_blocked, timeout=120)
-    finally:
-        juju.model_config(reset='juju-https-proxy')
-    juju.wait(jubilant.all_active, timeout=120)
+def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
+    juju.model_config(reset='juju-https-proxy')
+    juju.wait(
+        lambda _: workload_environment(juju).get('HTTPS_PROXY') == '',
+        delay=5,
+        timeout=120,
+    )
 ```
 
-This example assumes that an earlier test deployed the charm, as in {ref}`write-integration-tests-for-a-charm`. We recommend including the `charm` fixture (even though it's not used) so that the test fails immediately if a `.charm` file isn't available.
+#### Test a machine charm
 
-See also: [](jubilant.Juju.model_config)-->
+For a machine charm with a systemd service, read the environment of the running workload process. This also checks that the charm restarted the service after it changed the drop-in file:
+
+```python
+import pathlib
+
+import jubilant
+import pytest
+
+APP = 'proxy-machine'
+UNIT = f'{APP}/0'
+SERVICE = 'my-workload.service'
+PROXY_URL = 'http://proxy.example.com:3128'
+
+
+@pytest.fixture(scope='module', autouse=True)
+def frequent_update_status(juju: jubilant.Juju):
+    """Run update-status every 10 seconds, so the charm reads the new proxy configs sooner."""
+    juju.model_config({'update-status-hook-interval': '10s'})
+    yield
+    juju.model_config(reset='update-status-hook-interval')
+
+
+def workload_environment(juju: jubilant.Juju) -> str:
+    """Return the environment of the running workload process, one variable per line."""
+    pid = juju.ssh(UNIT, 'systemctl', 'show', SERVICE, '--property=MainPID', '--value')
+    environ = juju.ssh(UNIT, 'sudo', 'cat', f'/proc/{pid.strip()}/environ')
+    return environ.replace('\0', '\n')
+
+
+@pytest.mark.juju_setup
+def test_deploy(charm: pathlib.Path, juju: jubilant.Juju):
+    juju.deploy(charm, app=APP)
+    juju.wait(jubilant.all_active, timeout=600)
+
+
+def test_proxy_configs_reach_the_workload(juju: jubilant.Juju):
+    juju.model_config({'juju-https-proxy': PROXY_URL})
+    juju.wait(
+        lambda _: f'HTTPS_PROXY={PROXY_URL}\n' in workload_environment(juju),
+        delay=5,
+        timeout=120,
+    )
+
+
+def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
+    juju.model_config(reset='juju-https-proxy')
+    juju.wait(
+        lambda _: 'HTTPS_PROXY=\n' in workload_environment(juju),
+        delay=5,
+        timeout=120,
+    )
+```
+
+These examples use the `charm` fixture and the `juju` fixture from `pytest-jubilant`, as in {ref}`write-integration-tests-for-a-charm`.
