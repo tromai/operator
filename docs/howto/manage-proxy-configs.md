@@ -126,13 +126,26 @@ If the workload expects a configuration file, write the configs to a file in the
 
 ### Manage proxy options for the workload on a machine charm
 
-You can set the proxy for your machine workload
+In a machine charm, the charm and its workload run on the same machine, so the charm can write the proxy configs directly to where the workload reads them.
 
-In a machine charm, the charm and its workload live in the same place. Therefore the charm can modify the machine environment directly:
-- If the workload expects environmental variables, the charms can set the environment variables itself.
-- If the workload expects a configuration file, generate the configuration into a file with {external+charmlibs:ref}`pathops <charmlibs-pathops>`.
+A long-running workload, such as a systemd service or a snap, doesn't inherit the environment of the charm process. The charm must store the proxy configs somewhere that persists between events, then restart the workload so that it reads the new values.
 
-Machine charms needs to install and manage system packages.
+The reconciler pattern is similar to a Kubernetes charm: convert [](ops.ProxyConfig) into the format that the workload expects, compare the result with what the workload currently has, and restart the workload only if they differ.
+
+How the charm writes the proxy configs depends on how the workload reads them:
+
+| How the workload reads the proxy configs | How the charm writes the proxy configs |
+|---|---|
+| Environment variables, in a systemd service | Write a systemd drop-in file in `/etc/systemd/system/<service>.d/` with `Environment=` lines, using {external+charmlibs:ref}`pathops <charmlibs-pathops>`. Then reload systemd and restart the service with {external+charmlibs:ref}`charmlibs-systemd <charmlibs-systemd>`. |
+| Environment variables, in a command that the charm runs, such as `git` or `curl`. | Pass the variables with the `env` argument of {external+python:func}`subprocess.run`. |
+| A configuration file | Render the workload's configuration to a local file with {external+charmlibs:ref}`pathops <charmlibs-pathops>`. |
+| A configuration API, such as snap options, or the workload's own CLI options | Set snap options with {external+charmlibs:ref}`charmlibs-snap <charmlibs-snap>`, or call the workload's API or tool. |
+
+These machine charms pass the proxy configs to their workloads:
+
+- [`k8s`](https://github.com/canonical/k8s-operator/tree/main/charms/worker/k8s/src/charm.py): writes a systemd drop-in file for the `containerd` snap service.
+- [`vault`](https://github.com/canonical/vault-k8s-operator/tree/main/machine/src/charm.py): writes a systemd drop-in file for the Vault snap service.
+- [`lxd`](https://github.com/canonical/charm-lxd/tree/main/src/charm.py): sets the LXD `core.proxy_http`, `core.proxy_https`, and `core.proxy_ignore_hosts` options through the LXD API.
 
 ### Manage proxy options for the charm process
 
@@ -168,7 +181,7 @@ For `requests`, see [requests | Advanced usage | Proxies](https://requests.readt
 
 - Don't include the proxy URL in log messages or in the status message, as it can contain credentials.
 - Set both lowercase and uppercase proxy environment variables, as tools can depend on either of them.
-- Each tool receives proxy config differently, even different format for no_proxy, so check how your workload reads them.
+- Each tool receives proxy config differently, even different format for no_proxy. Your charm needs to parse and validate them for invalid configs.
 
 ## Test the feature
 
