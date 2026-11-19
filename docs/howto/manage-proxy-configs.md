@@ -80,7 +80,7 @@ class MyCharm(ops.CharmBase):
     def _proxy_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
         return ops.pebble.Layer({
             'services': {
-                'proxy-app': {
+                'fastapi': {
                     'override': 'merge',
                     'environment': proxy_env,
                 },
@@ -88,9 +88,11 @@ class MyCharm(ops.CharmBase):
         })
 ```
 
-The layer only adds environment variables to the `proxy-app` service, so add it after the layer that defines the service.
+The examples on this page use the `proxy-app` container, which runs the [`api-demo-server`](https://github.com/canonical/api_demo_server) rock. The rock's Pebble layer defines a service called `fastapi`. The proxy layer only adds environment variables to that service, so add it after the layer that defines the service.
 
-The workload image or the charm defines the service. If the image is a [rock](https://documentation.ubuntu.com/rockcraft/stable/), its Pebble layer defines the service, and the reconciler can observe `pebble-ready` directly. If the charm defines the service in its `pebble-ready` handler, call the reconciler after adding the base layer. Then Pebble starts the service once, with the proxy configs, instead of starting it without them and restarting it:
+Because a [rock](https://documentation.ubuntu.com/rockcraft/stable/) defines its services, the reconciler can observe `pebble-ready` directly. `_get_proxy_environ` always returns every variable, so on the first event the comparison finds a difference and `replan()` starts the service with the proxy configs.
+
+If the charm defines the service instead, in its `pebble-ready` handler, call the reconciler after adding the base layer. Then Pebble starts the service once, with the proxy configs, instead of starting it without them and restarting it:
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -104,7 +106,7 @@ class MyCharm(ops.CharmBase):
     def _on_pebble_ready(self, event: ops.PebbleReadyEvent) -> None:
         layer: ops.pebble.LayerDict = {
             'services': {
-                'proxy-app': {
+                'fastapi': {
                     'override': 'replace',
                     'command': 'uvicorn api_demo_server.app:app --host=0.0.0.0 --port=8000',
                     'startup': 'enabled',
@@ -128,7 +130,7 @@ class MyCharm(ops.CharmBase):
     def _reconcile(self, event: ops.EventBase) -> None:
         if not self.container.can_connect():
             return
-        service = self.container.get_plan().services.get('proxy-app')
+        service = self.container.get_plan().services.get('fastapi')
         if service is None:
             # The proxy layer can only merge into a service that's already defined.
             return
@@ -241,7 +243,7 @@ def workload_layer() -> ops.pebble.Layer:
     """Return the layer that defines the workload service, before any proxy configs."""
     return ops.pebble.Layer({
         'services': {
-            'proxy-app': {
+            'fastapi': {
                 'override': 'replace',
                 'command': 'my-workload',
                 'startup': 'enabled',
@@ -269,7 +271,7 @@ def test_proxy_configs_reach_the_workload():
     state_out = ctx.run(ctx.on.pebble_ready(container), state_in)
 
     plan = state_out.get_container('proxy-app').plan
-    environment = plan.services['proxy-app'].environment
+    environment = plan.services['fastapi'].environment
     assert environment['HTTPS_PROXY'] == PROXY_URL
     assert environment['https_proxy'] == PROXY_URL
     assert environment['HTTP_PROXY'] == ''
@@ -281,7 +283,7 @@ def test_removed_proxy_configs_are_cleared():
     # The workload has proxy configs from an earlier event.
     proxy_layer = ops.pebble.Layer({
         'services': {
-            'proxy-app': {
+            'fastapi': {
                 'override': 'merge',
                 'environment': {'HTTPS_PROXY': PROXY_URL, 'https_proxy': PROXY_URL},
             }
@@ -300,7 +302,7 @@ def test_removed_proxy_configs_are_cleared():
     state_out = ctx.run(ctx.on.update_status(), state_in)
 
     plan = state_out.get_container('proxy-app').plan
-    environment = plan.services['proxy-app'].environment
+    environment = plan.services['fastapi'].environment
     assert environment['HTTPS_PROXY'] == ''
     assert environment['https_proxy'] == ''
 ```
@@ -420,7 +422,7 @@ Juju doesn't fire an event when the proxy configs change, so the charm only read
 
 #### Test a Kubernetes charm
 
-For a Kubernetes charm, read the Pebble plan in the workload container. The test below deploys the charm with the [`api_demo_server`](https://github.com/canonical/api_demo_server) image, which is a small web server. The charm defines the `proxy-app` service that runs the server, as in {ref}`manage-proxy-configs-kubernetes`. The test only reads the Pebble plan, so it doesn't depend on what the workload does. Any image with a long-running command works.
+For a Kubernetes charm, read the Pebble plan of the workload container. The test below deploys the charm with the `api-demo-server` rock, which is a small web server. The rock defines the `fastapi` service. The test only reads the Pebble plan, so it doesn't depend on what the workload does.
 
 ```python
 import pathlib
@@ -444,8 +446,16 @@ def frequent_update_status(juju: jubilant.Juju):
 
 def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
     """Return the environment of the workload service in the Pebble plan."""
-    plan = juju.ssh(UNIT, '/charm/bin/pebble', 'plan', container='proxy-app')
-    return yaml.safe_load(plan)['services']['proxy-app'].get('environment', {})
+    # Run Pebble in the charm container, because a rock doesn't have the shell that
+    # `juju ssh --container` needs.
+    plan = juju.ssh(
+        UNIT,
+        'env',
+        'PEBBLE_SOCKET=/charm/containers/proxy-app/pebble.socket',
+        '/charm/bin/pebble',
+        'plan',
+    )
+    return yaml.safe_load(plan)['services']['fastapi'].get('environment', {})
 
 
 @pytest.mark.juju_setup
@@ -453,7 +463,7 @@ def test_deploy(charm: pathlib.Path, juju: jubilant.Juju):
     juju.deploy(
         charm,
         app=APP,
-        resources={'proxy-app-image': 'ghcr.io/canonical/api_demo_server:1.0.4'},
+        resources={'proxy-app-image': 'ghcr.io/canonical/api_demo_server/api-demo-server:3.0.0'},
     )
     juju.wait(jubilant.all_active, timeout=600)
 
@@ -476,7 +486,7 @@ def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
     )
 ```
 
-The plan shows what the charm asks Pebble to run. To also check that Pebble restarted the service with the new values, read `/proc/<pid>/environ` of the service process in the workload container, as in the machine example below. This needs `pgrep` and `cat` in the image, which a minimal rock doesn't have.
+The plan shows what the charm asks Pebble to run. To also check that Pebble restarted the service with the new values, read `/proc/<pid>/environ` of the service process, as in the machine example below. A rock like `api-demo-server` has no shell or `cat`, so this only works for an image that has them.
 
 #### Test a machine charm
 
