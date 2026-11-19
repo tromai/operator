@@ -32,7 +32,7 @@ class MyCharm(ops.CharmBase):
 
 The `no` attribute of [](ops.ProxyConfig) contains the comma-separated entries of `juju-no-proxy` as a tuple of strings. An empty `juju-no-proxy` is an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
 
-Ops passes the proxy configs on as plain strings, and doesn't validate them. Juju doesn't fire an event when the proxy configs change, the charm can only observe the change the next time an event fire. Charms can read the proxy configs using the {ref}`reconciler pattern <handling-events-holistically>`:
+Ops passes the proxy configs on as plain strings, and doesn't validate them. Juju doesn't fire an event when the proxy configs change, the charm can only observe the change the next time an event fires. Charms can read the proxy configs using the {ref}`reconciler pattern <handling-events-holistically>`:
 
 ```python
 import ops
@@ -71,7 +71,7 @@ The workload typically reads the proxy configs itself, so the charm needs to put
 
 When the workload runs in a sidecar container, the charm can pass the proxy configs with Pebble.
 
-If the workload reads  `*_proxy` or `*_PROXY` environment variables, create a Pebble layer that merges the variables into the existing service definition:
+If the workload reads `*_proxy` or `*_PROXY` environment variables, create a Pebble layer that merges the variables into the existing service definition:
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -89,6 +89,35 @@ class MyCharm(ops.CharmBase):
 ```
 
 The layer only adds environment variables to the `proxy-app` service, so add it after the layer that defines the service.
+
+The workload image or the charm defines the service. If the image is a [rock](https://documentation.ubuntu.com/rockcraft/stable/), its Pebble layer defines the service, and the reconciler can observe `pebble-ready` directly. If the charm defines the service in its `pebble-ready` handler, call the reconciler after adding the base layer. Then Pebble starts the service once, with the proxy configs, instead of starting it without them and restarting it:
+
+```python
+class MyCharm(ops.CharmBase):
+    def __init__(self, framework: ops.Framework):
+        super().__init__(framework)
+        self.container = self.unit.get_container('proxy-app')
+        framework.observe(self.on['proxy-app'].pebble_ready, self._on_pebble_ready)
+        framework.observe(self.on.config_changed, self._reconcile)
+        framework.observe(self.on.update_status, self._reconcile)
+
+    def _on_pebble_ready(self, event: ops.PebbleReadyEvent) -> None:
+        layer: ops.pebble.LayerDict = {
+            'services': {
+                'proxy-app': {
+                    'override': 'replace',
+                    'command': 'uvicorn api_demo_server.app:app --host=0.0.0.0 --port=8000',
+                    'startup': 'enabled',
+                }
+            }
+        }
+        self.container.add_layer('base', layer, combine=True)
+        self._reconcile(event)
+        # Starts the service, if the reconciler didn't already start it.
+        self.container.replan()
+
+    ...
+```
 
 In the reconciler, compare the proxy configs with the environment of the service in the current plan. If they differ, add the layer and restart the workload with [](ops.Container.replan):
 
@@ -115,14 +144,14 @@ class MyCharm(ops.CharmBase):
 ```
 
 ```{note}
-`replan()` only restarts a service if its configuration in the plan changed, so environment variables change doesn't strictly need the explicit comparison. This is still a good habit for the reconciler pattern, the charm only restarts the workload when the proxy configs change. For example, the workload reads proxy configs from CLI options, and requires a restart to use the new proxy configs.
+`replan()` only restarts a service if its configuration in the plan changed, so a change to environment variables doesn't strictly need the explicit comparison. The comparison is still a good habit for the reconciler pattern: the charm only restarts the workload when the proxy configs change. For example, a workload that reads proxy configs from CLI options needs a restart to use the new proxy configs.
 ```
 
 [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers/blob/main/src/coordinated_workers/worker.py) uses a similar approach: it rebuilds the Pebble layer in every event that it reconciles, and restarts the services if the layer differs from the current plan.
 
 If the workload reads a configuration file, write the proxy configs to {ref}`a file in the workload container <files-in-containers-write-a-file>`.
 
-A workload can read proxy configs from CLI options, which the charm pass through using a new Pebble layer, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator/blob/main/src/charm.py) passes the proxy configs to its workload as JVM flags.
+A workload can read proxy configs from CLI options, which the charm passes on using a new Pebble layer. For example, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator/blob/main/src/charm.py) passes the proxy configs to its workload as JVM flags.
 
 (manage-proxy-configs-machine)=
 ### Machine charms
@@ -134,10 +163,10 @@ If the workload reads the proxy configs from a file, write the file with {extern
 - A systemd service that reads environment variables. Write a systemd drop-in file in `/etc/systemd/system/<service>.service.d/`. Then reload systemd and restart the service with {external+charmlibs:ref}`charmlibs-systemd <charmlibs-systemd>`. For example, the [`k8s`](https://github.com/canonical/k8s-operator/tree/main/charms/worker/k8s/src/charm.py) charm writes a drop-in file for the `containerd` snap service, and the [`vault`](https://github.com/canonical/vault-k8s-operator/tree/main/machine/src/charm.py) charm writes a drop-in file for the Vault snap service.
 - A workload with its own configuration file. Render the proxy configs into the workload's configuration file, then restart or reload the workload.
 
-You can pass the proxy configs it to the to workload through its CLI options, or API:
+You can also pass the proxy configs to the workload through its CLI options or API:
 - A snap workload can be configured with {external+charmlibs:ref}`charmlibs-snap <charmlibs-snap>`.
-- The workload's start-up command can have the proxy configs as CLI options
-- [`lxd`](https://github.com/canonical/charm-lxd/tree/main/src/charm.py) charm uses the PXD API to sets its `core.proxy_http`, `core.proxy_https`, and `core.proxy_ignore_hosts` options.
+- The workload's start-up command can have the proxy configs as CLI options.
+- The [`lxd`](https://github.com/canonical/charm-lxd/tree/main/src/charm.py) charm uses the LXD API to set its `core.proxy_http`, `core.proxy_https`, and `core.proxy_ignore_hosts` options.
 
 The reconciler is similar to a Kubernetes charm: convert [](ops.ProxyConfig) into the format that the workload expects, compare the result with what the workload has, and restart the workload only if they differ. For example, a systemd service:
 
@@ -168,8 +197,14 @@ class MyCharm(ops.CharmBase):
         # ensure_contents only writes the file if the contents differ.
         if pathops.ensure_contents(PROXY_DROP_IN, '\n'.join(lines) + '\n'):
             systemd.daemon_reload()
-            systemd.service_restart(SERVICE)
+            # A workload that isn't running reads the drop-in file when it starts.
+            if systemd.service_running(SERVICE):
+                systemd.service_restart(SERVICE)
 ```
+
+Only restart the service if it's running. The reconciler runs in `config-changed`, which Juju emits before `start`, and the charm might also have stopped the workload on purpose, for example in an action that takes the unit out of service. Restarting would start the workload in both cases.
+
+Systemd ignores an `Environment=` line that has an invalid `%` specifier, so without the `%` escape the workload silently loses the proxy config.
 
 ## Manage proxy configs for the charm process
 
@@ -203,7 +238,7 @@ PROXY_URL = 'http://proxy.example.com:3128'
 
 
 def workload_layer() -> ops.pebble.Layer:
-    """The layer that defines the workload service, before any proxy configs."""
+    """Return the layer that defines the workload service, before any proxy configs."""
     return ops.pebble.Layer({
         'services': {
             'proxy-app': {
@@ -270,9 +305,13 @@ def test_removed_proxy_configs_are_cleared():
     assert environment['https_proxy'] == ''
 ```
 
+The reconciler runs in every `config-changed` and `update-status` event, so it accesses the container in your existing tests of those events too. Scenario raises an error if the container isn't in the state. Add `testing.Container('proxy-app')` to the state of those tests. The container can't connect to Pebble by default, so the reconciler does nothing.
+
 #### Test a machine charm
 
 For a machine charm, check the file or API that the charm writes the proxy configs to. Replace the parts of the charm that change the machine, so that the tests don't need root access or a real service.
+
+The reconciler runs in every `config-changed` and `update-status` event, so it changes the machine in your existing tests of those events too. Define the fixtures in `conftest.py`, and apply them to every test in the module with `pytestmark = pytest.mark.usefixtures('drop_in', 'restarted')`.
 
 These tests are for `MyCharm` from {ref}`manage-proxy-configs-machine`:
 
@@ -306,6 +345,7 @@ def restarted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return True
 
     monkeypatch.setattr(charm.systemd, 'daemon_reload', lambda: True)
+    monkeypatch.setattr(charm.systemd, 'service_running', lambda service: True)
     monkeypatch.setattr(charm.systemd, 'service_restart', service_restart)
     return services
 
@@ -351,6 +391,22 @@ def test_unchanged_proxy_configs_dont_restart_the_workload(
     ctx.run(ctx.on.update_status(), state_in)
 
     assert restarted == []
+
+
+def test_stopped_workload_is_not_restarted(
+    monkeypatch: pytest.MonkeyPatch, drop_in: pathops.LocalPath, restarted: list[str]
+):
+    monkeypatch.setattr(charm.systemd, 'service_running', lambda service: False)
+    ctx = testing.Context(charm.MyCharm)
+    state_in = testing.State(
+        model=testing.Model(proxy_config=testing.ProxyConfig(https=PROXY_URL)),
+    )
+
+    ctx.run(ctx.on.update_status(), state_in)
+
+    # The workload reads the drop-in file when it starts.
+    assert PROXY_URL in drop_in.read_text()
+    assert restarted == []
 ```
 
 (manage-proxy-configs-integration-tests)=
@@ -364,7 +420,7 @@ Juju doesn't fire an event when the proxy configs change, so the charm only read
 
 #### Test a Kubernetes charm
 
-For a Kubernetes charm, read the Pebble plan in the workload container:
+For a Kubernetes charm, read the Pebble plan in the workload container. The test below deploys the charm with the [`api_demo_server`](https://github.com/canonical/api_demo_server) image, which is a small web server. The charm defines the `proxy-app` service that runs the server, as in {ref}`manage-proxy-configs-kubernetes`. The test only reads the Pebble plan, so it doesn't depend on what the workload does. Any image with a long-running command works.
 
 ```python
 import pathlib
@@ -394,7 +450,11 @@ def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
 
 @pytest.mark.juju_setup
 def test_deploy(charm: pathlib.Path, juju: jubilant.Juju):
-    juju.deploy(charm, app=APP, resources={'proxy-app-image': 'ubuntu/nginx:latest'})
+    juju.deploy(
+        charm,
+        app=APP,
+        resources={'proxy-app-image': 'ghcr.io/canonical/api_demo_server:1.0.4'},
+    )
     juju.wait(jubilant.all_active, timeout=600)
 
 
@@ -415,6 +475,8 @@ def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
         timeout=120,
     )
 ```
+
+The plan shows what the charm asks Pebble to run. To also check that Pebble restarted the service with the new values, read `/proc/<pid>/environ` of the service process in the workload container, as in the machine example below. This needs `pgrep` and `cat` in the image, which a minimal rock doesn't have.
 
 #### Test a machine charm
 
