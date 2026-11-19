@@ -12,26 +12,27 @@ import ops
 
 
 class MyCharm(ops.CharmBase):
-    def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
+    def __init__(self, framework: ops.Framework):
+        super().__init__(framework)
+
+    def _get_proxy_environ(self) -> dict[str, str]:
         proxy = self.model.proxy_config
-        environment = {}
-        if proxy.http:
-            environment['HTTP_PROXY'] = proxy.http
-            environment['http_proxy'] = proxy.http
-        if proxy.https:
-            environment['HTTPS_PROXY'] = proxy.https
-            environment['https_proxy'] = proxy.https
-        if proxy.no:
-            environment['NO_PROXY'] = ','.join(proxy.no)
-            environment['no_proxy'] = ','.join(proxy.no)
-        ...
+        no_proxy = ','.join(sorted(proxy.no))
+        return {
+            'HTTP_PROXY': proxy.http or '',
+            'HTTPS_PROXY': proxy.https or '',
+            'NO_PROXY': no_proxy,
+            'http_proxy': proxy.http or '',
+            'https_proxy': proxy.https or '',
+            'no_proxy': no_proxy,
+        }
 ```
 
 [](ops.ProxyConfig) stores an empty `juju-http-proxy` or `juju-https-proxy` as `None`.
 
 The `no` attribute of [](ops.ProxyConfig) contains the comma-separated entries of `juju-no-proxy` as a tuple of strings. An empty `juju-no-proxy` is an empty tuple. Entries in `no` can contain wildcards (`*.example.com`, or `*` for everything), domain suffixes (`.example.com`), or CIDRs (`10.0.0.0/8`).
 
-Ops passes the proxy configs on as plain strings, and doesn't validate them. Juju doesn't fire an event when the proxy configs change, so the charm must read the proxy configs in every event that it observes, following the {ref}`reconciler pattern <handling-events-holistically>`:
+Ops passes the proxy configs on as plain strings, and doesn't validate them. Juju doesn't fire an event when the proxy configs change, the charm can only observe the change the next time an event fire. Charms can read the proxy configs using the {ref}`reconciler pattern <handling-events-holistically>`:
 
 ```python
 import ops
@@ -45,40 +46,32 @@ class MyCharm(ops.CharmBase):
         framework.observe(self.on.config_changed, self._reconcile)
         framework.observe(self.on.update_status, self._reconcile)
 
-    def _proxy_env(self) -> dict[str, str]:
-        proxy = self.model.proxy_config
-        # Sort the entries, so that reordering juju-no-proxy doesn't restart the workload.
-        no_proxy = ','.join(sorted(proxy.no))
-        return {
-            # Use an empty string for an unset proxy config, so that the workload
-            # stops using a value that the charm set in an earlier event.
-            'HTTP_PROXY': proxy.http or '',
-            'HTTPS_PROXY': proxy.https or '',
-            'NO_PROXY': no_proxy,
-            'http_proxy': proxy.http or '',
-            'https_proxy': proxy.https or '',
-            'no_proxy': no_proxy,
-        }
+    ...
 
     def _reconcile(self, event: ops.EventBase) -> None:
         if not self.container.can_connect():
             return
-        proxy_env = self._proxy_env()
+        proxy_env = self._get_proxy_environ()
         # Pass proxy_env to the workload, as described in the next section.
-        ...
+```
+
+```{admonition} Best practice
+:class: hint
+:name: best-practice-proxy-url-handling
+
+Don't include the proxy URLs in log messages or in the status message, as they can contain credentials. Tools accept the proxy configs in different formats, especially `no_proxy`. Validate the proxy configs before passing them to the workload.
 ```
 
 ## Manage proxy configs for the workload
 
 The workload typically reads the proxy configs itself, so the charm needs to put the proxy configs where the workload expects them.
 
-Most workloads read the `*_proxy` or `*_PROXY` environment variables. Some read a configuration file or start-up flags. For example, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator) passes the proxy configs to its workload as JVM flags.
-
-### Manage proxy configs for the workload on Kubernetes
+(manage-proxy-configs-kubernetes)=
+### Kubernetes charms
 
 When the workload runs in a sidecar container, the charm can pass the proxy configs with Pebble.
 
-If the workload reads environment variables, create a Pebble layer that merges the variables into the existing service definition:
+If the workload reads  `*_proxy` or `*_PROXY` environment variables, create a Pebble layer that merges the variables into the existing service definition:
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -97,7 +90,7 @@ class MyCharm(ops.CharmBase):
 
 The layer only adds environment variables to the `proxy-app` service, so add it after the layer that defines the service.
 
-In the reconciler, add the layer and call [](ops.Container.replan). Pebble only restarts a service if its configuration changed, so the charm can add the layer and replan in every event, and the workload only restarts when the proxy configs change:
+In the reconciler, compare the proxy configs with the environment of the service in the current plan. If they differ, add the layer and restart the workload with [](ops.Container.replan):
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -106,32 +99,47 @@ class MyCharm(ops.CharmBase):
     def _reconcile(self, event: ops.EventBase) -> None:
         if not self.container.can_connect():
             return
-        proxy_layer = self._proxy_layer(self._proxy_env())
-        self.container.add_layer('proxy-workload', proxy_layer, combine=True)
-        self.container.replan()
+        service = self.container.get_plan().services.get('proxy-app')
+        if service is None:
+            # The proxy layer can only merge into a service that's already defined.
+            return
+        proxy_env = self._get_proxy_environ()
+        changed = any(
+            service.environment.get(name) != value for name, value in proxy_env.items()
+        )
+        if changed:
+            self.container.add_layer(
+                'proxy-workload', self._proxy_layer(proxy_env), combine=True
+            )
+            self.container.replan()
+```
+
+```{note}
+`replan()` only restarts a service if its configuration in the plan changed, so environment variables change doesn't strictly need the explicit comparison. This is still a good habit for the reconciler pattern, the charm only restarts the workload when the proxy configs change. For example, the workload reads proxy configs from CLI options, and requires a restart to use the new proxy configs.
 ```
 
 [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers/blob/main/src/coordinated_workers/worker.py) uses a similar approach: it rebuilds the Pebble layer in every event that it reconciles, and restarts the services if the layer differs from the current plan.
 
-If the workload reads a configuration file, write the proxy configs to a file in the workload container. See {ref}`files-in-containers`.
+If the workload reads a configuration file, write the proxy configs to {ref}`a file in the workload container <files-in-containers-write-a-file>`.
+
+A workload can read proxy configs from CLI options, which the charm pass through using a new Pebble layer, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator/blob/main/src/charm.py) passes the proxy configs to its workload as JVM flags.
 
 (manage-proxy-configs-machine)=
-### Manage proxy configs for the workload in a machine charm
+### Machine charms
 
 In a machine charm, the charm and its workload run on the same machine, so the charm can write the proxy configs directly to where the workload reads them.
 
-A long-running workload, such as a systemd service or a snap, doesn't inherit the environment of the charm process. The charm must store the proxy configs somewhere that persists between events, then restart the workload so that it reads the new values.
+If the workload reads the proxy configs from a file, write the file with {external+charmlibs:ref}`pathops <charmlibs-pathops>`. There are two common cases:
 
-How the charm writes the proxy configs depends on how the workload reads them:
+- A systemd service that reads environment variables. Write a systemd drop-in file in `/etc/systemd/system/<service>.service.d/`. Then reload systemd and restart the service with {external+charmlibs:ref}`charmlibs-systemd <charmlibs-systemd>`. For example, the [`k8s`](https://github.com/canonical/k8s-operator/tree/main/charms/worker/k8s/src/charm.py) charm writes a drop-in file for the `containerd` snap service, and the [`vault`](https://github.com/canonical/vault-k8s-operator/tree/main/machine/src/charm.py) charm writes a drop-in file for the Vault snap service.
+- A workload with its own configuration file. Render the proxy configs into the workload's configuration file, then restart or reload the workload.
 
-| How the workload reads the proxy configs | How the charm writes the proxy configs |
-|---|---|
-| Environment variables, in a systemd service | Write a systemd drop-in file in `/etc/systemd/system/<service>.service.d/` with `Environment=` lines, using {external+charmlibs:ref}`pathops <charmlibs-pathops>`. Then reload systemd and restart the service with {external+charmlibs:ref}`charmlibs-systemd <charmlibs-systemd>`. |
-| Environment variables, in a command that the charm runs, such as `git` or `curl` | Pass the variables with the `env` argument of {external+python:func}`subprocess.run`. |
-| A configuration file | Render the workload's configuration to a local file with {external+charmlibs:ref}`pathops <charmlibs-pathops>`. |
-| A configuration API, such as snap options, or the workload's own CLI options | Set snap options with {external+charmlibs:ref}`charmlibs-snap <charmlibs-snap>`, or call the workload's API or tool. |
+You can pass the proxy configs it to the to workload through its CLI options, or API:
+- A snap workload can be configured with {external+charmlibs:ref}`charmlibs-snap <charmlibs-snap>`.
+- The workload's start-up command can have the proxy configs as CLI options
+- [`lxd`](https://github.com/canonical/charm-lxd/tree/main/src/charm.py) charm uses the PXD API to sets its `core.proxy_http`, `core.proxy_https`, and `core.proxy_ignore_hosts` options.
 
-The reconciler is similar to a Kubernetes charm: convert [](ops.ProxyConfig) into the format that the workload expects, compare the result with what the workload has, and restart the workload only if they differ. For example, for a systemd service that reads environment variables:
+The reconciler is similar to a Kubernetes charm: convert [](ops.ProxyConfig) into the format that the workload expects, compare the result with what the workload has, and restart the workload only if they differ. For example, a systemd service:
 
 ```python
 import ops
@@ -147,12 +155,12 @@ class MyCharm(ops.CharmBase):
         framework.observe(self.on.config_changed, self._reconcile)
         framework.observe(self.on.update_status, self._reconcile)
 
-    def _proxy_env(self) -> dict[str, str]:
+    def _get_proxy_environ(self) -> dict[str, str]:
         ...  # The same as in "Read the proxy configs".
 
     def _reconcile(self, event: ops.EventBase) -> None:
         lines = ['[Service]']
-        for name, value in self._proxy_env().items():
+        for name, value in self._get_proxy_environ().items():
             # systemd expands '%' specifiers in Environment=, and proxy URLs
             # can contain '%' in percent-encoded credentials.
             value = value.replace('%', '%%')
@@ -163,51 +171,13 @@ class MyCharm(ops.CharmBase):
             systemd.service_restart(SERVICE)
 ```
 
-These machine charms pass the proxy configs to their workloads:
-
-- [`k8s`](https://github.com/canonical/k8s-operator/tree/main/charms/worker/k8s/src/charm.py): writes a systemd drop-in file for the `containerd` snap service.
-- [`vault`](https://github.com/canonical/vault-k8s-operator/tree/main/machine/src/charm.py): writes a systemd drop-in file for the Vault snap service.
-- [`lxd`](https://github.com/canonical/charm-lxd/tree/main/src/charm.py): sets the LXD `core.proxy_http`, `core.proxy_https`, and `core.proxy_ignore_hosts` options through the LXD API.
-
 ## Manage proxy configs for the charm process
 
-The charm can make its own HTTP requests, for example to download a file or call an API.
+The charm process can make its own HTTP requests, for example to download a file or call an API.
 
-Juju passes the proxy configs to the charm only as the `JUJU_CHARM_HTTP_PROXY`, `JUJU_CHARM_HTTPS_PROXY`, and `JUJU_CHARM_NO_PROXY` environment variables. HTTP libraries such as {external+python:mod}`urllib.request` and `requests` read the `*_proxy` environment variables instead, so by default they ignore the proxy configs.
+Refer to the libraries' documentation such as {external+python:mod}`urllib.request` and [requests | Advanced usage | Proxies](https://requests.readthedocs.io/en/latest/user/advanced/#proxies) for more information.
 
-Pass the proxy configs to the library when the charm makes a request. For example, pass a {external+python:class}`urllib.request.ProxyHandler` to {external+python:func}`urllib.request.build_opener`:
-
-```python
-import os
-import urllib.request
-
-import ops
-
-
-class MyCharm(ops.CharmBase):
-    def _get_latest_release(self) -> str:
-        proxy = self.model.proxy_config
-        proxies = {}
-        if proxy.http:
-            proxies['http'] = proxy.http
-        if proxy.https:
-            proxies['https'] = proxy.https
-        # ProxyHandler has no argument for juju-no-proxy, and reads
-        # the no_proxy environment variable instead.
-        os.environ['no_proxy'] = ','.join(proxy.no)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
-        url = 'https://api.github.com/repos/canonical/operator/releases/latest'
-        with opener.open(url) as response:
-            return response.read().decode('utf-8')
-```
-
-For `requests`, see [requests | Advanced usage | Proxies](https://requests.readthedocs.io/en/latest/user/advanced/#proxies).
-
-## Best practices
-
-- Don't include the proxy URL in log messages or in the status message, as it can contain credentials.
-- Set both lowercase and uppercase proxy environment variables, as tools can depend on either of them.
-- Tools accept the proxy configs in different formats, especially `no_proxy`. Convert and validate the proxy configs for each tool that the charm passes them to.
+If the charm uses {external+python:func}`subprocess.run`, it can pass the proxy configs to the `env` argument.
 
 ## Test the feature
 
@@ -215,13 +185,13 @@ For `requests`, see [requests | Advanced usage | Proxies](https://requests.readt
 
 See first: {ref}`write-unit-tests-for-a-charm`
 
-To set the proxy configs in a unit test, pass a [](ops.testing.ProxyConfig) to [](ops.testing.Model). The charm reads the values with [](ops.Model.proxy_config), as it would in a real Juju model. A default `ProxyConfig()` matches a model with Juju's default proxy configs: no HTTP or HTTPS proxy, and `juju-no-proxy` set to `127.0.0.1,localhost,::1`.
+To set the proxy configs in a unit test, pass a [](ops.testing.ProxyConfig) to [](ops.testing.Model). A default `ProxyConfig()` creates a model with `juju-http-proxy` and `juju-https-proxy` as empty strings, and `juju-no-proxy` is set to `127.0.0.1,localhost,::1`.
 
-Test that the proxy configs reach the workload, and that the charm clears them when the proxy configs are removed.
+We want to test that the proxy configs reach the workload, and in sync with the proxy model configs.
 
 #### Test a Kubernetes charm
 
-For a Kubernetes charm, check the environment of the workload service in the Pebble plan:
+These tests are for `MyCharm` from {ref}`manage-proxy-configs-kubernetes`:
 
 ```python
 import ops
@@ -304,7 +274,7 @@ def test_removed_proxy_configs_are_cleared():
 
 For a machine charm, check the file or API that the charm writes the proxy configs to. Replace the parts of the charm that change the machine, so that the tests don't need root access or a real service.
 
-The following tests are for the machine charm in {ref}`Manage proxy configs for the workload in a machine charm <manage-proxy-configs-machine>`:
+These tests are for `MyCharm` from {ref}`manage-proxy-configs-machine`:
 
 ```python
 import pathlib
@@ -500,5 +470,3 @@ def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
         timeout=120,
     )
 ```
-
-These examples use the `charm` fixture and the `juju` fixture from `pytest-jubilant`, as in {ref}`write-integration-tests-for-a-charm`.
