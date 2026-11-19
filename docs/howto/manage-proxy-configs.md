@@ -121,7 +121,7 @@ class MyCharm(ops.CharmBase):
     ...
 ```
 
-In the reconciler, compare the proxy configs with the environment of the service in the current plan. If they differ, add the layer and restart the workload with [](ops.Container.replan):
+In the reconciler, add the layer and call [](ops.Container.replan). Pebble restarts the service only if the plan changed, so the charm doesn't restart the workload when the proxy configs are the same:
 
 ```python
 class MyCharm(ops.CharmBase):
@@ -135,23 +135,17 @@ class MyCharm(ops.CharmBase):
             # The proxy layer can only merge into a service that's already defined.
             return
         proxy_env = self._get_proxy_environ()
-        changed = any(
-            service.environment.get(name) != value for name, value in proxy_env.items()
-        )
-        if changed:
-            self.container.add_layer(
-                'proxy-workload', self._proxy_layer(proxy_env), combine=True
-            )
-            self.container.replan()
-```
-
-```{note}
-`replan()` only restarts a service if its configuration in the plan changed, so a change to environment variables doesn't strictly need the explicit comparison. The comparison is still a good habit for the reconciler pattern: the charm only restarts the workload when the proxy configs change. For example, a workload that reads proxy configs from CLI options needs a restart to use the new proxy configs.
+        self.container.add_layer('proxy-workload', self._proxy_layer(proxy_env), combine=True)
+        self.container.replan()
 ```
 
 [`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers/blob/main/src/coordinated_workers/worker.py) uses a similar approach: it rebuilds the Pebble layer in every event that it reconciles, and restarts the services if the layer differs from the current plan.
 
 If the workload reads a configuration file, write the proxy configs to {ref}`a file in the workload container <files-in-containers-write-a-file>`.
+
+```{note}
+`replan()` only restarts a service if its configuration in the plan changed. That's enough for environment variables and CLI options, because they're part of the plan. A change to a configuration file isn't part of the plan, so `replan()` leaves the service running with the old file. In the reconciler, compare the rendered file with the file in the container, and only if they differ, push the new file and restart the service with [](ops.Container.restart).
+```
 
 A workload can read proxy configs from CLI options, which the charm passes on using a new Pebble layer. For example, [`trino-k8s-operator`](https://github.com/canonical/trino-k8s-operator/blob/main/src/charm.py) passes the proxy configs to its workload as JVM flags.
 
@@ -532,7 +526,6 @@ def test_proxy_configs_reach_the_workload(juju: jubilant.Juju):
         delay=5,
         timeout=120,
     )
-
 
 def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
     juju.model_config(reset='juju-https-proxy')
