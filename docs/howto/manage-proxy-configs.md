@@ -352,18 +352,11 @@ def test_proxy_configs(juju: jubilant.Juju):
 
 #### Test a machine charm
 
-For a machine charm with a systemd service, read the environment that systemd has loaded for the service with `systemctl show`. `systemctl show` only shows the new values after the charm writes the drop-in file and reloads systemd, so this checks both steps. It doesn't check that the charm restarted the service, which the unit tests cover.
+For a machine charm, the integration test is similar to the Kubernetes charm example above. The difference is how the test reads the proxy configuration that the workload receives.
 
-These tests assume that the charm is already deployed as `my-charm`, for example by a `test_deploy` test that uses the `charm` fixture, as described in {ref}`write-integration-tests-for-a-charm`.
+For example, if the workload runs as a systemd service, use `systemctl show`:
 
 ```python
-@pytest.fixture(scope='module', autouse=True)
-def frequent_update_status(juju: jubilant.Juju):
-    juju.model_config({'update-status-hook-interval': '1m'})
-    yield
-    juju.model_config(reset='update-status-hook-interval')
-
-
 def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
     output = juju.ssh(
         'my-charm/0',
@@ -377,35 +370,4 @@ def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
     # For example:
     #     HTTP_PROXY=http://proxy.example.com:8080 NO_PROXY=localhost,127.0.0.1,.example.com "OTHER= foo bar"
     return dict(entry.split('=', 1) for entry in shlex.split(output))
-
-
-def test_proxy_configs(juju: jubilant.Juju):
-    proxy_url = 'http://proxy.example.com:3128'
-    juju.model_config({
-        'juju-https-proxy': proxy_url,
-        'juju-no-proxy': 'localhost,10.0.0.0/8',
-    })
-    expected = {
-        'HTTP_PROXY': '',
-        'HTTPS_PROXY': proxy_url,
-        'NO_PROXY': '10.0.0.0/8,localhost',
-    }
-    juju.wait(
-        lambda _: workload_environment(juju).items() >= expected.items(),
-        delay=5,
-        timeout=300,
-    )
-
-    juju.model_config(reset=['juju-https-proxy', 'juju-no-proxy'])
-    expected = {
-        'HTTP_PROXY': '',
-        'HTTPS_PROXY': '',
-        'NO_PROXY': '127.0.0.1,::1,localhost',
-    }
-    juju.wait(
-        lambda _: workload_environment(juju).items() >= expected.items(),
-        delay=5,
-        timeout=300,
-    )
-    # Use juju.model_config to restore model config if necessary.
 ```
