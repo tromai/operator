@@ -88,8 +88,6 @@ class MyCharm(ops.CharmBase):
         self.container.replan()
 ```
 
-[`cos-coordinated-workers`](https://github.com/canonical/cos-coordinated-workers/blob/main/src/coordinated_workers/worker.py) uses a similar approach: it rebuilds the Pebble layer in every event that it reconciles, and restarts the services if the layer differs from the current plan.
-
 A workload may read proxy configuration from CLI options. The CLI options are part of the startup command for the service layer. To be able to configure them, the charm needs to add a Pebble layer that overrides the definition of the original service. With `'override': 'merge'`, the new layer only replaces the `command` of the service. The example below assumes that the `workload` command accepts the proxy configuration as CLI options:
 
 ```python
