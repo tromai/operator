@@ -88,11 +88,11 @@ class MyCharm(ops.CharmBase):
         self.container.replan()
 ```
 
-A workload may read proxy configuration from CLI options. The CLI options are part of the startup command for the service layer. To be able to configure them, the charm needs to add a Pebble layer that overrides the definition of the original service. With `'override': 'merge'`, the new layer only replaces the `command` of the service. The example below assumes that the `workload` command accepts the proxy configuration as CLI options:
+A workload may read proxy configuration from CLI options. The CLI options are part of the startup command for the service layer. The example below assumes that the `workload` command accepts the proxy configuration as CLI options:
 
 ```python
 class MyCharm(ops.CharmBase):
-    def _command_layer(self) -> ops.pebble.Layer:
+    def _get_pebble_layer(self) -> ops.pebble.Layer:
         proxy = self.model.proxy_config
         args = ['workload', '--port=8000']
         if proxy.http:
@@ -104,7 +104,8 @@ class MyCharm(ops.CharmBase):
         return ops.pebble.Layer({
             'services': {
                 'workload': {
-                    'override': 'merge',
+                    'override': 'replace',
+                    'startup': 'enabled',
                     'command': shlex.join(args),
                 },
             },
@@ -113,9 +114,8 @@ class MyCharm(ops.CharmBase):
     def _reconcile(self, event: ops.EventBase) -> None:
         if not self.container.can_connect():
             return
-        self.container.add_layer('base', self._base_layer(), combine=True)
         self.container.add_layer(
-            'proxy-command', self._command_layer(), combine=True
+            'workload', self._get_pebble_layer(), combine=True
         )
         self.container.replan()
 ```
