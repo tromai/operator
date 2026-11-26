@@ -214,7 +214,7 @@ We want to test that the proxy configuration reaches the workload, and stays in 
 These tests are for the {ref}`Kubernetes charm shown above <manage-proxy-configs-kubernetes>`:
 
 ```python
-def test_proxy_configs_reach_the_workload():
+def test_proxy_configuration_reaches_the_workload():
     proxy_url = 'http://proxy.example.com:3128'
     ctx = testing.Context(MyCharm)
     container = testing.Container('workload', can_connect=True)
@@ -252,7 +252,7 @@ def service_restart(monkeypatch: pytest.MonkeyPatch) -> mock.Mock:
     return restart
 
 
-def test_proxy_configs_reach_the_workload(
+def test_proxy_configuration_reaches_the_workload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ):
     proxy_url = 'http://proxy.example.com:3128'
@@ -271,7 +271,7 @@ def test_proxy_configs_reach_the_workload(
     assert 'Environment="NO_PROXY=10.0.0.0/8,localhost"' in content
 
 
-def test_unchanged_proxy_configs_dont_restart_the_workload(
+def test_unchanged_proxy_configuration_doesnt_restart_the_workload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     service_restart: mock.Mock,
@@ -325,7 +325,7 @@ class MyCharm(ops.CharmBase):
 In the test, change the proxy configuration, then change the `proxy-update` option to a new value, and probe the `show-proxy` action with [](jubilant.Juju.run) until it reports the expected proxy:
 
 ```python
-def test_proxy_configs(juju: jubilant.Juju):
+def test_proxy_configuration(juju: jubilant.Juju):
     proxy_url = 'http://proxy.example.com:3128'
     juju.model_config({'juju-https-proxy': proxy_url})
     juju.config('my-charm', {'proxy-update': 'boo'})
