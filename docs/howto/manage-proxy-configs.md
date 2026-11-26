@@ -179,7 +179,7 @@ class MyCharm(ops.CharmBase):
 
 The charm process can make its own HTTP requests, for example to download a file or call an API.
 
-Refer to the libraries' documentation such as {external+python:mod}`urllib.request` and [requests | Proxies ](https://requests.readthedocs.io/en/latest/user/advanced/#proxies) for more information.
+Refer to the libraries' documentation such as {external+python:mod}`urllib.request` and [requests | Proxies](https://requests.readthedocs.io/en/latest/user/advanced/#proxies) for more information.
 
 If the charm uses {external+python:func}`subprocess.run`, it can pass the proxy configuration with the `env` argument. For example:
 
@@ -190,7 +190,7 @@ subprocess.run(
     ],
     env={
         **os.environ,
-        'HTTP_PROXY': 'example.com',
+        'HTTP_PROXY': 'https://proxy.example.com:3128',
     },
 )
 ```
@@ -207,7 +207,7 @@ To set the proxy configuration in a unit test, pass a [](ops.testing.ProxyConfig
 If you don't pass a `proxy_config` to [](ops.testing.Model), the charm gets no proxy configuration, and `self.model.proxy_config.no` is an empty tuple. This exists for backward compatibility, and might change in a future major release of Ops.
 ```
 
-We want to test that the proxy configuration reaches the workload, and stays in sync with the proxy model configuration.
+We want to test that the proxy configuration reaches the workload.
 
 #### Test a Kubernetes charm
 
@@ -238,7 +238,7 @@ def test_proxy_configuration_reaches_the_workload():
 
 #### Test a machine charm
 
-For a machine charm, check the file or API that the charm writes the proxy configuration to. Mock out those parts, so that the unit tests do not modify the testing environment, and are deterministic.
+For a machine charm, check the file or API that the charm writes the proxy configuration to. Mock out those parts so that the unit tests do not modify the testing environment, and are deterministic.
 
 These tests are for the {ref}`machine charm shown above <manage-proxy-configs-machine>`:
 
@@ -301,8 +301,8 @@ In an integration test, change the proxy configuration with [](jubilant.Juju.mod
 These tests assume:
 
 - The charm is already deployed as `my-charm`, for example by a `test_deploy` test that uses the `charm` fixture, as described in {ref}`write-integration-tests-for-a-charm`.
-- The charm has a configuration option `proxy-update`. We only use it to trigger `config-changed`, and let the charm update the new proxy configuration.
-- The charm has an action `show-proxy` that returns the proxy host and port from the workload. For example: `proxy.example.com:3128`, or an empty string if no proxy configuration is set.
+- The charm has a configuration option `proxy-update`. We only use it to trigger `config-changed` and make the charm apply the new proxy configuration.
+- The charm has an action `show-proxy` that returns the proxy host and port from the workload. For example `proxy.example.com:3128`, or an empty string if no proxy configuration is set.
 
 Let's add a handler for the `show-proxy` action:
 
